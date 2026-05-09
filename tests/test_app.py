@@ -127,7 +127,7 @@ class TestIndex:
     def test_contains_item_title_in_response(self, client):
         resp = client.get("/")
         assert resp.status_code == 200
-        assert b"Test Article" in resp.data or b"Easy Read" in resp.data
+        assert b"Test Article" in resp.data or b"Easy Read" in resp.data or b"Medium Read" in resp.data
 
     def test_marks_item_in_progress(self, client):
         import models

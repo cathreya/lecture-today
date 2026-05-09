@@ -4,7 +4,7 @@ import os
 import sys
 import json
 import sqlite3
-from flask import Flask, render_template, request, redirect, url_for, jsonify
+from flask import Flask, render_template, request, redirect, url_for, jsonify, send_from_directory
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -12,6 +12,14 @@ from models import init_db, get_db
 from config import get_llm_config
 
 app = Flask(__name__)
+
+_db_initialized = False
+
+def _ensure_db():
+    global _db_initialized
+    if not _db_initialized:
+        init_db()
+        _db_initialized = True
 
 def get_curriculum():
     from curriculum import pick_next_item, pick_lighter_item
@@ -28,9 +36,8 @@ def get_anki():
 
 @app.before_request
 def before_request():
-    if request.path.startswith("/static"):
-        return
-    init_db()
+    if not request.path.startswith("/static"):
+        _ensure_db()
 
 
 @app.route("/")
@@ -194,26 +201,32 @@ def skip():
     reason = data.get("reason", "not_right_now")
 
     from models import compute_resurface_date
-    resurface = compute_resurface_date(reason)
-    db.execute(
-        "INSERT INTO skips (item_id, reason, resurface_after) VALUES (?, ?, ?)",
-        (item_id, reason, resurface)
-    )
 
-    # Check graveyard: 3+ not_interested skips
-    if reason == "not_interested":
-        skip_count = db.execute(
-            "SELECT COUNT(*) as c FROM skips WHERE item_id = ? AND reason = 'not_interested'",
+    # too_long is not a real skip — it's a chunking request, no cooldown
+    if reason == "too_long":
+        db.execute(
+            "UPDATE items SET status = 'unread', error_reason = 'needs_chunking', chunk_total = NULL WHERE id = ?",
             (item_id,)
-        ).fetchone()["c"]
-        if skip_count >= 3:
-            db.execute("UPDATE items SET status = 'skipped', error_reason = 'graveyard' WHERE id = ?", (item_id,))
+        )
+    else:
+        resurface = compute_resurface_date(reason)
+        db.execute(
+            "INSERT INTO skips (item_id, reason, resurface_after) VALUES (?, ?, ?)",
+            (item_id, reason, resurface)
+        )
+
+        # Check graveyard: 3+ not_interested skips
+        if reason == "not_interested":
+            skip_count = db.execute(
+                "SELECT COUNT(*) as c FROM skips WHERE item_id = ? AND reason = 'not_interested'",
+                (item_id,)
+            ).fetchone()["c"]
+            if skip_count >= 3:
+                db.execute("UPDATE items SET status = 'skipped', error_reason = 'graveyard' WHERE id = ?", (item_id,))
+            else:
+                db.execute("UPDATE items SET status = 'skipped' WHERE id = ?", (item_id,))
         else:
             db.execute("UPDATE items SET status = 'skipped' WHERE id = ?", (item_id,))
-    elif reason == "too_long":
-        db.execute("UPDATE items SET status = 'unread', error_reason = 'needs_chunking' WHERE id = ?", (item_id,))
-    else:
-        db.execute("UPDATE items SET status = 'skipped' WHERE id = ?", (item_id,))
 
     db.commit()
 
@@ -247,11 +260,21 @@ def setup_post():
     messages_path = data.get("messages_path", "../messages.html")
     files_path = data.get("files_path", "../files")
 
-    # Resolve paths relative to app directory
+    # Resolve paths safely — reject absolute paths and path traversal
     import os
     app_dir = os.path.dirname(os.path.abspath(__file__))
-    messages_path = os.path.join(app_dir, messages_path)
-    files_path = os.path.join(app_dir, files_path)
+    project_root = os.path.dirname(app_dir)
+
+    def safe_resolve(user_path, default):
+        if not user_path or user_path != user_path.strip():
+            return os.path.join(project_root, default)
+        # Reject absolute paths and traversal attempts
+        if os.path.isabs(user_path) or ".." in user_path:
+            return os.path.join(project_root, default)
+        return os.path.normpath(os.path.join(app_dir, user_path))
+
+    messages_path = safe_resolve(messages_path, "messages.html")
+    files_path = safe_resolve(files_path, "files")
 
     # Parse messages.html
     from parser import parse_messages_html
@@ -259,16 +282,23 @@ def setup_post():
 
     db = get_db()
     inserted = 0
+    notes_inserted = 0
     for item in items:
         try:
+            # Notes and file-only items have no URL — use the content_type or a fallback
+            url = item.get("url")
+            if not url:
+                url = f"note://{item.get('content_type', 'unknown')}/{hash(item.get('description', ''))}"
             db.execute(
                 "INSERT INTO items (url, title, domain, content_type, description, local_file_path) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (item["url"], item.get("title", ""), item.get("domain", ""),
+                (url, item.get("title", ""), item.get("domain", ""),
                  item.get("content_type", "unknown"), item.get("description", ""),
                  item.get("local_file_path"))
             )
             inserted += 1
+            if item.get("content_type") == "note":
+                notes_inserted += 1
         except sqlite3.IntegrityError:
             pass  # Duplicate URL, skip
 
@@ -278,6 +308,7 @@ def setup_post():
         "redirect": "/",
         "items_found": len(items),
         "items_inserted": inserted,
+        "notes_saved": notes_inserted,
         "next_step": "Run: python classifier.py"
     })
 
@@ -289,8 +320,20 @@ def card_queue_status():
     return jsonify({"pending": count})
 
 
+@app.route("/files/<path:filepath>")
+def serve_file(filepath):
+    """Serve local files (PDFs, etc.) from the project's files/ directory."""
+    import os
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    safe_path = os.path.normpath(os.path.join(project_root, "files", filepath))
+    if not safe_path.startswith(os.path.join(project_root, "files")):
+        return "Forbidden", 403
+    if not os.path.isfile(safe_path):
+        return "File not found", 404
+    return send_from_directory(os.path.join(project_root, "files"), filepath)
+
+
 if __name__ == "__main__":
-    init_db()
     config = get_llm_config()
     if not config["api_key"]:
         print("Warning: No LLM API key set. Classification pipeline will not work.")

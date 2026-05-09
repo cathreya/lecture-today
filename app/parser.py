@@ -344,6 +344,7 @@ def parse_messages(
 parse_messages_html = parse_messages
 
 
+
 def summary_stats(items: list[dict]) -> dict:
     """Compute summary statistics over the parsed items."""
     total = len(items)
@@ -378,9 +379,6 @@ def print_summary(items: list[dict]) -> None:
     for domain, count in stats["domains"][:10]:
         print(f"    {domain:>20s}: {count}")
 
-
-# Alias for app.py compatibility
-parse_messages_html = parse_messages
 
 # ── CLI entry point ──────────────────────────────────────────────────
 
