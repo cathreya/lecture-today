@@ -10,10 +10,7 @@
 *.db-shm
 *.db-wal
 
-# Built Mac app
-capture/mac/build/
-capture/mac/*.app/
-
 # Python
 __pycache__/
 .pytest_cache/
+.venv/
